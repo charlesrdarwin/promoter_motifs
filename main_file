@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+Scan upstream regions of annotated CDS features in the tupanvirus soda lake
+GenBank record for early and late promoter motifs.
+
+Input:
+  * By default, fetches accession KY523104.3 from NCBI using Bio.Entrez.
+  * Alternatively, accepts a local GenBank file with --genbank.
+
+Output:
+  One CSV row per CDS feature, including motif hits, sequences, coordinates,
+  and upstream sequence in 5'->3' transcriptional orientation.
+
+Requirements:
+  pip install biopython
+
+Examples:
+  # Fetch the current NCBI record and scan using the motif exactly as written
+  # in the question (interpreting AT(8) as A followed by 8 Ts):
+  python tupanvirus_promoter_scan.py \
+      --email you@example.org \
+      --accession KY523104.3 \
+      --late-mode user \
+      --out tupanvirus_KY523104.3_promoter_results.csv
+
+  python tupanvirus_promoter_scan.py \
+      --email you@example.org \
+      --accession KY523104.3 \
+      --late-mode published \
+      --max-mismatches 1 \
+      --out tupanvirus_KY523104.3_promoter_results_published_late.csv
+
+  # Scan a GenBank file already downloaded from NCBI (offline after download):
+  python tupanvirus_promoter_scan.py \
+      --genbank KY523104.3.gb \
+      --late-mode published \
+      --max-mismatches 1 \
+      --out tupanvirus_KY523104.3_promoter_results.csv
+
+Motif definitions:
+  Early:
+      AAAATTGA (exact)
+
+  User-supplied late motif, interpreted literally as:
+      AT{8}T[AC]T{4}[AT]{5}AG[TA][TG]A
+      i.e. A + 8 T's + T + A/C + 4 T's + 5 A/T's + AG + A/T + T/G + A.
+
+  Published consensus reported for Megamimivirinae/Tupanvirus work:
+      [AT]{8}T[AC]T[ACGT]{4}[AT]{5}[AG]TA[TG]A
+      with one mismatch allowed in the cited promoter-search analysis.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import sys
+from io import StringIO
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+try:
+    from Bio import Entrez, SeqIO
+except ImportError as exc:  # pragma: no cover - user-facing dependency error
+    raise SystemExit(
+        "Biopython is required. Install it with: pip install biopython"
+    ) from exc
+
+
+DEFAULT_ACCESSION = "KY523104.3"
+DEFAULT_UPSTREAM_NT = 150
+EARLY_REGEX = re.compile(r"AAAATTGA", re.IGNORECASE)
+
+# Exact interpretation of the motif string supplied by the user.
+# Here AT(8) is interpreted literally as A followed by 8 T residues.
+USER_LATE_REGEX = re.compile(
+    r"AT{8}T[AC]T{4}[AT]{5}AG[TA][TG]A", re.IGNORECASE
+)
+
+# Published consensus from the cited study, written as per-position allowed bases.
+# Consensus: [AT](8)T[AC]TN(4)[AT](5)[AG]TA[TG]A
+# N is treated as any DNA base, and mismatch counting is positional.
+PUBLISHED_LATE_ALLOWED: List[set[str]] = (
+    [set("AT")] * 8
+    + [set("T"), set("AC"), set("T")]
+    + [set("ACGT")] * 4
+    + [set("AT")] * 5
+    + [set("AG"), set("T"), set("A"), set("TG"), set("A")]
+)
+
+EXPECTED_PUBLISHED_LATE_LENGTH = len(PUBLISHED_LATE_ALLOWED)
+if EXPECTED_PUBLISHED_LATE_LENGTH != 25:  # defensive sanity check
+    raise RuntimeError(
+        f"Internal published late-motif definition has length "
+        f"{EXPECTED_PUBLISHED_LATE_LENGTH}, expected 25."
+    )
+
+CSV_FIELDS = [
+    "record_id",
+    "record_accession",
+    "record_version",
+    "cds_index",
+    "gene",
+    "locus_tag",
+    "protein_id",
+    "product",
+    "strand",
+    "genomic_cds_interval_1based",
+    "translation_start_genomic_interval_1based",
+    "translation_start_codon",
+    "start_codon_is_ATG_GTG_TTG",
+    "codon_start",
+    "upstream_requested_nt",
+    "upstream_available_nt",
+    "upstream_genomic_interval_1based",
+    "upstream_sequence_5to3",
+    "early_motif_found",
+    "early_motif_count",
+    "early_motif_positions_1based_upstream",
+    "early_motif_sequences",
+    "late_mode",
+    "late_max_mismatches",
+    "late_motif_found",
+    "late_motif_count",
+    "late_motif_positions_1based_upstream",
+    "late_motif_sequences",
+    "late_motif_mismatch_counts",
+    "status",
+]
+
+
+def clean_qualifier(feature, key: str) -> str:
+    values = feature.qualifiers.get(key, [])
+    if not values:
+        return ""
+    return "; ".join(str(v).replace("\n", " ").strip() for v in values)
+
+
+def fetch_genbank(accession: str, email: str) -> str:
+    """Fetch a GenBank text record from NCBI E-utilities."""
+    Entrez.email = email
+    Entrez.tool = "tupanvirus_promoter_scan"
+    with Entrez.efetch(
+        db="nuccore",
+        id=accession,
+        rettype="gbwithparts",
+        retmode="text",
+    ) as handle:
+        return handle.read()
+
+
+def load_record(accession: str, email: str | None, genbank_path: Path | None):
+    if genbank_path is not None:
+        with genbank_path.open("r", encoding="utf-8") as handle:
+            record = SeqIO.read(handle, "genbank")
+        source_text = None
+        source = str(genbank_path)
+    else:
+        if not email:
+            raise ValueError(
+                "--email is required when --genbank is not supplied. "
+                "NCBI asks for a valid contact email with E-utilities."
+            )
+        source_text = fetch_genbank(accession, email)
+        record = SeqIO.read(StringIO(source_text), "genbank")
+        source = f"NCBI nuccore/{accession}"
+    return record, source_text, source
+
+
+def get_cds_start_data(feature):
+    """Return strand, codon_start, translation-start genomic boundary, etc.
+
+    Coordinates returned for calculations are 0-based half-open boundaries.
+    For + strand, the translation start boundary is before the first translated
+    base. For - strand, the translation start boundary is the genomic boundary
+    immediately after the last base of the start codon in transcriptional order.
+    """
+    strand = feature.location.strand
+    if strand not in (1, -1):
+        return None
+
+    codon_start_text = clean_qualifier(feature, "codon_start")
+    try:
+        codon_start = int(codon_start_text.split(";")[0]) if codon_start_text else 1
+    except ValueError:
+        codon_start = 1
+    if codon_start not in (1, 2, 3):
+        codon_start = 1
+
+    loc_start = int(feature.location.start)
+    loc_end = int(feature.location.end)
+    frame_offset = codon_start - 1
+
+    if strand == 1:
+        translation_boundary = loc_start + frame_offset
+        # Upstream is immediately before the translation start in genomic order.
+        upstream_genomic_start = max(0, translation_boundary - DEFAULT_UPSTREAM_NT)
+        upstream_genomic_end = translation_boundary
+        # Genomic interval for the three start-codon bases.
+        start_codon_start = translation_boundary
+        start_codon_end = translation_boundary + 3
+    else:
+        # For reverse-strand CDS, the extracted sequence runs from loc_end-1
+        # toward loc_start. A frame offset means the translation start is that
+        # many coding-orientation bases inward from the feature end.
+        translation_boundary = loc_end - frame_offset
+        # In genomic order, upstream is toward larger coordinates. Actual
+        # clipping against the record length is done during extraction.
+        upstream_genomic_start = translation_boundary
+        upstream_genomic_end = translation_boundary + DEFAULT_UPSTREAM_NT
+        start_codon_start = translation_boundary - 3
+        start_codon_end = translation_boundary
+
+    return {
+        "strand": strand,
+        "codon_start": codon_start,
+        "translation_boundary": translation_boundary,
+        "upstream_genomic_start": upstream_genomic_start,
+        "upstream_genomic_end": upstream_genomic_end,
+        "start_codon_start": start_codon_start,
+        "start_codon_end": start_codon_end,
+        "loc_start": loc_start,
+        "loc_end": loc_end,
+    }
+
+
+def upstream_sequence(record, feature, start_data, requested_nt: int) -> Tuple[str, int, int]:
+    """Extract upstream sequence in 5'->3' transcriptional orientation."""
+    strand = start_data["strand"]
+    boundary = start_data["translation_boundary"]
+    genome_len = len(record.seq)
+
+    if strand == 1:
+        g_start = max(0, boundary - requested_nt)
+        g_end = max(0, min(boundary, genome_len))
+        seq = record.seq[g_start:g_end]
+    else:
+        g_start = max(0, boundary)
+        g_end = min(genome_len, boundary + requested_nt)
+        seq = record.seq[g_start:g_end].reverse_complement()
+
+    return str(seq).upper(), g_start, g_end
+
+
+def genomic_cds_interval(feature) -> str:
+    start = int(feature.location.start) + 1
+    end = int(feature.location.end)
+    if feature.location.strand == -1:
+        return f"complement({start}..{end})"
+    return f"{start}..{end}"
+
+
+def translation_start_interval(start_data) -> str:
+    start = start_data["start_codon_start"] + 1
+    end = start_data["start_codon_end"]
+    if start_data["strand"] == -1:
+        return f"complement({start}..{end})"
+    return f"{start}..{end}"
+
+
+def upstream_genomic_interval(start_data, g_start: int, g_end: int) -> str:
+    if g_end <= g_start:
+        return ""
+    if start_data["strand"] == 1:
+        return f"{g_start + 1}..{g_end}"
+    return f"complement({g_start + 1}..{g_end})"
+
+
+def scan_early(seq: str):
+    hits = []
+    for m in EARLY_REGEX.finditer(seq):
+        hits.append((m.start() + 1, m.group(0)))
+    return hits
+
+
+def scan_late_user(seq: str):
+    hits = []
+    for m in USER_LATE_REGEX.finditer(seq):
+        hits.append((m.start() + 1, m.group(0), 0))
+    return hits
+
+
+def scan_late_published(seq: str, max_mismatches: int):
+    """Scan the published consensus with positional class-based mismatches."""
+    hits = []
+    L = len(PUBLISHED_LATE_ALLOWED)
+    if len(seq) < L:
+        return hits
+
+    for i in range(0, len(seq) - L + 1):
+        window = seq[i : i + L]
+        mismatches = 0
+        for base, allowed in zip(window, PUBLISHED_LATE_ALLOWED):
+            if base not in allowed:
+                mismatches += 1
+                if mismatches > max_mismatches:
+                    break
+        if mismatches <= max_mismatches:
+            hits.append((i + 1, window, mismatches))
+    return hits
+
+
+def scan_late(seq: str, mode: str, max_mismatches: int):
+    if mode == "user":
+        return scan_late_user(seq)
+    if mode == "published":
+        return scan_late_published(seq, max_mismatches)
+    raise ValueError(f"Unknown late motif mode: {mode}")
+
+
+def format_int_list(values: Iterable[int]) -> str:
+    return ";".join(str(v) for v in values)
+
+
+def format_str_list(values: Iterable[str]) -> str:
+    return ";".join(values)
+
+
+def make_row(
+    record,
+    feature,
+    cds_index: int,
+    requested_nt: int,
+    late_mode: str,
+    max_mismatches: int,
+):
+    gene = clean_qualifier(feature, "gene")
+    locus_tag = clean_qualifier(feature, "locus_tag")
+    protein_id = clean_qualifier(feature, "protein_id")
+    product = clean_qualifier(feature, "product")
+
+    base = {
+        "record_id": record.id,
+        "record_accession": ";".join(record.annotations.get("accessions", [])),
+        "record_version": record.annotations.get("sequence_version", ""),
+        "cds_index": cds_index,
+        "gene": gene,
+        "locus_tag": locus_tag,
+        "protein_id": protein_id,
+        "product": product,
+        "strand": feature.location.strand if feature.location.strand in (1, -1) else "",
+        "genomic_cds_interval_1based": genomic_cds_interval(feature),
+        "translation_start_genomic_interval_1based": "",
+        "translation_start_codon": "",
+        "start_codon_is_ATG_GTG_TTG": "",
+        "codon_start": "",
+        "upstream_requested_nt": requested_nt,
+        "upstream_available_nt": 0,
+        "upstream_genomic_interval_1based": "",
+        "upstream_sequence_5to3": "",
+        "early_motif_found": False,
+        "early_motif_count": 0,
+        "early_motif_positions_1based_upstream": "",
+        "early_motif_sequences": "",
+        "late_mode": late_mode,
+        "late_max_mismatches": max_mismatches if late_mode == "published" else 0,
+        "late_motif_found": False,
+        "late_motif_count": 0,
+        "late_motif_positions_1based_upstream": "",
+        "late_motif_sequences": "",
+        "late_motif_mismatch_counts": "",
+        "status": "ok",
+    }
+
+    start_data = get_cds_start_data(feature)
+    if start_data is None:
+        base["status"] = "skipped: CDS strand is not +1 or -1"
+        return base
+
+    base["strand"] = start_data["strand"]
+    base["codon_start"] = start_data["codon_start"]
+    base["translation_start_genomic_interval_1based"] = translation_start_interval(start_data)
+
+    # Extract the CDS in its coding orientation and determine the actual first
+    # translated codon after the GenBank codon_start offset.
+    cds_seq = str(feature.extract(record.seq)).upper()
+    frame_offset = start_data["codon_start"] - 1
+    start_codon = cds_seq[frame_offset : frame_offset + 3]
+    base["translation_start_codon"] = start_codon
+    base["start_codon_is_ATG_GTG_TTG"] = start_codon in {"ATG", "GTG", "TTG"}
+
+    seq, g_start, g_end = upstream_sequence(record, feature, start_data, requested_nt)
+    base["upstream_available_nt"] = len(seq)
+    base["upstream_genomic_interval_1based"] = upstream_genomic_interval(
+        start_data, g_start, g_end
+    )
+    base["upstream_sequence_5to3"] = seq
+
+    early_hits = scan_early(seq)
+    late_hits = scan_late(seq, late_mode, max_mismatches)
+
+    base["early_motif_found"] = bool(early_hits)
+    base["early_motif_count"] = len(early_hits)
+    base["early_motif_positions_1based_upstream"] = format_int_list(
+        hit[0] for hit in early_hits
+    )
+    base["early_motif_sequences"] = format_str_list(hit[1] for hit in early_hits)
+
+    base["late_motif_found"] = bool(late_hits)
+    base["late_motif_count"] = len(late_hits)
+    base["late_motif_positions_1based_upstream"] = format_int_list(
+        hit[0] for hit in late_hits
+    )
+    base["late_motif_sequences"] = format_str_list(hit[1] for hit in late_hits)
+    base["late_motif_mismatch_counts"] = format_int_list(hit[2] for hit in late_hits)
+
+    return base
+
+
+def scan_record(record, requested_nt, late_mode, max_mismatches):
+    rows = []
+    cds_features = [f for f in record.features if f.type == "CDS"]
+
+    for cds_index, feature in enumerate(cds_features, start=1):
+        rows.append(
+            make_row(
+                record,
+                feature,
+                cds_index,
+                requested_nt,
+                late_mode,
+                max_mismatches,
+            )
+        )
+    return rows
+
+
+def write_csv(rows, output_path: Path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def parse_args(argv: Sequence[str] | None = None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
+        "--genbank",
+        type=Path,
+        help="Local GenBank file. If supplied, NCBI is not contacted.",
+    )
+    source_group.add_argument(
+        "--accession",
+        default=DEFAULT_ACCESSION,
+        help=f"NCBI nuccore accession (default: {DEFAULT_ACCESSION}).",
+    )
+    parser.add_argument(
+        "--email",
+        help="Email for NCBI E-utilities; required when fetching from NCBI.",
+    )
+    parser.add_argument(
+        "--upstream",
+        type=int,
+        default=DEFAULT_UPSTREAM_NT,
+        help=f"Number of nt to scan upstream (default: {DEFAULT_UPSTREAM_NT}).",
+    )
+    parser.add_argument(
+        "--late-mode",
+        choices=("user", "published"),
+        default="user",
+        help=(
+            "Late motif definition: 'user' interprets the motif in the question "
+            "literally as AT{8}T[AC]T{4}[AT]{5}AG[TA][TG]A; 'published' uses "
+            "the published consensus [AT]{8}T[AC]T N{4}[AT]{5}[AG]TA[TG]A."
+        ),
+    )
+    parser.add_argument(
+        "--max-mismatches",
+        type=int,
+        default=0,
+        help=(
+            "Maximum positional mismatches for --late-mode published. The cited "
+            "study used 1 mismatch; set this to 1 to reproduce that rule. Ignored "
+            "for --late-mode user."
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("tupanvirus_KY523104.3_promoter_results.csv"),
+        help="Output CSV path.",
+    )
+    parser.add_argument(
+        "--save-genbank",
+        type=Path,
+        help="Optional path for the fetched GenBank record (fetch mode only).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.upstream < 1:
+        raise SystemExit("--upstream must be >= 1")
+    if args.max_mismatches < 0:
+        raise SystemExit("--max-mismatches must be >= 0")
+
+    try:
+        record, source_text, source = load_record(
+            args.accession if hasattr(args, "accession") else DEFAULT_ACCESSION,
+            args.email,
+            args.genbank,
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not load the GenBank record.\nSource: "
+            f"{args.genbank if args.genbank else args.accession}\nError: {exc}\n"
+            "Tip: download the GenBank record in a browser and rerun with --genbank."
+        ) from exc
+
+    if args.save_genbank and source_text is not None:
+        args.save_genbank.write_text(source_text, encoding="utf-8")
+
+    # Recompute using the requested upstream length rather than the internal
+    # default used by get_cds_start_data's bookkeeping.
+    rows = []
+    cds_features = [f for f in record.features if f.type == "CDS"]
+    for cds_index, feature in enumerate(cds_features, start=1):
+        # make_row uses the requested length all the way through extraction.
+        rows.append(
+            make_row(
+                record,
+                feature,
+                cds_index,
+                args.upstream,
+                args.late_mode,
+                args.max_mismatches,
+            )
+        )
+
+    write_csv(rows, args.out)
+
+    n_early = sum(bool(r["early_motif_found"]) for r in rows)
+    n_late = sum(bool(r["late_motif_found"]) for r in rows)
+    print(f"Source: {source}")
+    print(f"Record: {record.id}")
+    print(f"CDS rows written: {len(rows)}")
+    print(f"CDS with >=1 early motif hit: {n_early}")
+    print(f"CDS with >=1 late motif hit: {n_late}")
+    print(f"Late motif mode: {args.late_mode}")
+    if args.late_mode == "published":
+        print(f"Published-mode max mismatches: {args.max_mismatches}")
+    print(f"CSV: {args.out.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
